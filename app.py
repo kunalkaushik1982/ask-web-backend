@@ -1,16 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from bs4 import BeautifulSoup
 import numpy as np
 from scipy.spatial.distance import cosine
-from langchain_openai import ChatOpenAI
-from langchain_openai import OpenAIEmbeddings
-from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 import requests
 
-import os
-load_dotenv()
 app = FastAPI()
 
 # Enable CORS for frontend communication
@@ -18,83 +15,158 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Change "*" to your frontend URL for better security
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
-# Initialize components
-embedding_model = OpenAIEmbeddings()
-llm = ChatOpenAI()
 
 class QueryRequest(BaseModel):
     url: str
     question: str
 
-def fetch_page_content(url):
+class SummarizationRequest(BaseModel):
+    url: str
+    style: str  # Can be "Concise", "Bullet Points", "Casual", "Professional"
+
+# Cache storage: {url: (chunks, chunk_embeddings)}
+embedding_cache = {}
+
+def fetch_page_content_old(url):
     """Fetch webpage content using requests."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     try:
-        #print(f"[INFO] Fetching content from URL: {url}")  # Debugging
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        #print("[INFO] Successfully fetched webpage content")  # Debugging
         return response.text
     except requests.exceptions.RequestException as e:
-        #print(f"[ERROR] Failed to fetch page: {e}")  # Debugging
         raise HTTPException(status_code=400, detail=f"Error fetching page: {str(e)}")
+
+def fetch_page_content(url):
+    """Fetch webpage content and extract only visible text."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        # Parse the HTML
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Remove unwanted elements (JavaScript, CSS)
+        for script in soup(["script", "style", "meta", "noscript", "iframe"]):
+            script.extract()  # Removes the tag from the soup
+
+        # Extract text and maintain paragraph order
+        text = "\n".join([p.get_text(separator=" ", strip=True) for p in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li"])])
+
+        # Ensure text is not empty
+        if not text.strip():
+            return "No relevant text found on this page."
+
+        return text
+
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Error fetching page: {str(e)}")
+
 
 def get_most_relevant_chunks(query_embedding, chunk_embeddings, chunks, top_k=3):
     """Find the top-k most relevant chunks using cosine similarity."""
-    #print("[INFO] Calculating cosine similarity between query and document chunks")  # Debugging
     similarities = [1 - cosine(query_embedding, emb) for emb in chunk_embeddings]
     top_indices = np.argsort(similarities)[-top_k:][::-1]
-    #print(f"[INFO] Top {top_k} relevant chunks selected")  # Debugging
     return [chunks[i] for i in top_indices]
 
 @app.post("/process_page/")
-async def process_page(request: QueryRequest):
+async def process_page(request: QueryRequest, authorization: str = Header(None)):
+    # Extract API key from Authorization header
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=400, detail="Missing or invalid API key")
+
+    openai_api_key = authorization.split("Bearer ")[1].strip()
+
     try:
-        #print(f"[INFO] Received request for URL: {request.url} with question: {request.question}")  # Debugging
         
-        # Fetch webpage content
-        page_content = fetch_page_content(request.url)
-        #print(f"[INFO] Page content length: {len(page_content)} characters")  # Debugging
+        # Check if the URL is already embedded in cache
+        if request.url in embedding_cache:
+            chunks, chunk_embeddings = embedding_cache[request.url]
+        else:
+            # Fetch and split webpage content
+            page_content = fetch_page_content(request.url)
+            
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+            chunks = splitter.split_text(page_content)
 
-        # Chunk text
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        chunks = splitter.split_text(page_content)
-        #print(f"[INFO] Split webpage into {len(chunks)} chunks")  # Debugging
+            # Initialize OpenAI components dynamically with API key
+            embedding_model = OpenAIEmbeddings(openai_api_key=openai_api_key)
 
-        # Compute embeddings for chunks
-        chunk_embeddings = embedding_model.embed_documents(chunks)
-        #print(f"[INFO] Generated embeddings for {len(chunks)} chunks")  # Debugging
+            # Compute embeddings once and cache
+            chunk_embeddings = embedding_model.embed_documents(chunks)
+            embedding_cache[request.url] = (chunks, chunk_embeddings)
 
         # Compute query embedding
+        embedding_model = OpenAIEmbeddings(openai_api_key=openai_api_key)  # Reinitialize for consistency
         query_embedding = embedding_model.embed_query(request.question)
-        #print("[INFO] Generated query embedding")  # Debugging
 
-        # Retrieve top relevant chunks
+        # Retrieve relevant chunks
         relevant_chunks = get_most_relevant_chunks(query_embedding, chunk_embeddings, chunks)
 
         # Generate response
         context = "\n".join(relevant_chunks)
-        #print(f"[INFO] Context selected for LLM:\n{context[:500]}...")  # Debugging (Prints first 500 chars)
-        # response = llm.predict(f"Answer the question based on this context:\n\n{context}\n\nQuestion: {request.question}")
-        # print (response)
+        llm = ChatOpenAI(openai_api_key=openai_api_key)
         response = llm.invoke(f"Answer the question based on this context:\n\n{context}\n\nQuestion: {request.question}")
-        #print (response)
-        #print(f"[INFO] LLM response: {response}")  # Debugging
 
-        # Extract answer from response
-        if isinstance(response, dict) and "content" in response:
-            response_text = response["content"]
-        else:
-            response_text = str(response.content)  # Fallback handling
+        # Extract answer
+        response_text = response.content if hasattr(response, "content") else str(response)
 
         return {"answer": response_text}
 
     except Exception as e:
-        #print(f"[ERROR] {str(e)}")  # Debugging
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/summarize_page/")
+async def summarize_page(request: SummarizationRequest, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=400, detail="Missing or invalid API key")
+
+    openai_api_key = authorization.split("Bearer ")[1].strip()
+
+    style_prompts = {
+        "Concise": "Summarize the following text in a short and precise way.",
+        "Bullet Points": "Summarize the following text using bullet points.",
+        "Casual": "Summarize the following text in a friendly and conversational way.",
+        "Professional": "Summarize the following text in a formal and professional manner."
+    }
+
+    if request.style not in style_prompts:
+        raise HTTPException(status_code=400, detail="Invalid summarization style")
+
+    try:
+        page_content = fetch_page_content(request.url)
+        if not page_content:
+            raise HTTPException(status_code=400, detail="Failed to extract webpage content")
+
+        # **Step 1: Split text into smaller chunks**
+        splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=100)
+        chunks = splitter.split_text(page_content)
+
+        # **Step 2: Initialize OpenAI Chat Model**
+        llm = ChatOpenAI(openai_api_key=openai_api_key)
+
+        # **Step 3: Summarize each chunk separately**
+        summaries = []
+        for chunk in chunks[:5]:  # Process up to 5 chunks to avoid token overload
+            prompt = f"{style_prompts[request.style]}\n\nText:\n{chunk}"
+            response = llm.invoke(prompt)
+            response_text = response.content if hasattr(response, "content") else str(response)
+            summaries.append(response_text)
+
+        # **Step 4: Combine summaries into a final response**
+        final_summary = "\n".join(summaries)
+
+        return {"summary": final_summary}
+
+    except Exception as e:
+        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
