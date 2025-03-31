@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -7,19 +7,30 @@ import numpy as np
 from scipy.spatial.distance import cosine
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.schema import HumanMessage
+from dotenv import load_dotenv
 import requests
 import json
+import os
+from typing import List, Tuple, Dict, Any, Optional
 
-app = FastAPI()
+# Load environment variables
+load_dotenv()
+
+# Initialize FastAPI app
+app = FastAPI(title="Web Content Processing API")
 
 # Enable CORS for frontend communication
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change "*" to your frontend URL for better security
+    allow_origins=["*"],  # For production, specify your frontend URL instead of "*"
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ==========================================================
+# Models
+# ==========================================================
 
 class QueryRequest(BaseModel):
     url: str
@@ -27,31 +38,59 @@ class QueryRequest(BaseModel):
 
 class SummarizationRequest(BaseModel):
     url: str
-    style: str  # Can be "Concise", "Bullet Points", "Casual", "Professional"
+    style: str  # "Concise", "Bullet Points", "Casual", "Professional"
 
 class AnalyzeRequest(BaseModel):
-    url:str
+    url: str
+
+class RelatedLink(BaseModel):
+    title: str
+    url: str
+    hostname: str
+
+class RelatedLinksResponse(BaseModel):
+    related_links: List[RelatedLink]
+
+class SuggestionResponse(BaseModel):
+    suggestions: Dict[str, Any]
+
+class AnswerResponse(BaseModel):
+    answer: str
+
+class SummaryResponse(BaseModel):
+    summary: str
+
+# ==========================================================
+# Global cache and constants
+# ==========================================================
 
 # Cache storage: {url: (chunks, chunk_embeddings)}
-embedding_cache = {}
+embedding_cache: Dict[str, Tuple[List[str], List[List[float]]]] = {}
 
-def fetch_page_content_old(url):
-    """Fetch webpage content using requests."""
+SUMMARIZATION_STYLES = {
+    "Concise": "Summarize the following text in a short and precise way.",
+    "Bullet Points": "Summarize the following text using bullet points.",
+    "Casual": "Summarize the following text in a friendly and conversational way.",
+    "Professional": "Summarize the following text in a formal and professional manner."
+}
+
+# ==========================================================
+# Utility Functions
+# ==========================================================
+
+def extract_api_key(authorization: str = Header(None)) -> str:
+    """Extract and validate API key from authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid API key")
+    
+    return authorization.split("Bearer ")[1].strip()
+
+def fetch_page_content(url: str) -> str:
+    """Fetch webpage content and extract only visible text using BeautifulSoup."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Error fetching page: {str(e)}")
-
-def fetch_page_content(url):
-    """Fetch webpage content and extract only visible text."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
+    
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
@@ -59,148 +98,154 @@ def fetch_page_content(url):
         # Parse the HTML
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Remove unwanted elements (JavaScript, CSS)
+        # Remove unwanted elements
         for script in soup(["script", "style", "meta", "noscript", "iframe"]):
-            script.extract()  # Removes the tag from the soup
+            script.extract()
 
-        # Extract text and maintain paragraph order
-        text = "\n".join([p.get_text(separator=" ", strip=True) for p in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li"])])
-
-        # Ensure text is not empty
-        if not text.strip():
+        # Extract text from relevant tags
+        text_elements = soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li"])
+        
+        if not text_elements:
             return "No relevant text found on this page."
-
-        return text
+            
+        # Join text with newlines to maintain paragraph structure
+        text = "\n".join([p.get_text(separator=" ", strip=True) for p in text_elements])
+        
+        return text.strip()
 
     except requests.exceptions.RequestException as e:
-        raise Exception(f"Error fetching page: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error fetching page: {str(e)}")
 
+def get_or_create_embeddings(url: str, openai_api_key: str) -> Tuple[List[str], List[List[float]]]:
+    """Get embeddings from cache or create and cache them if they don't exist."""
+    if url in embedding_cache:
+        return embedding_cache[url]
+    
+    # Fetch and split webpage content
+    page_content = fetch_page_content(url)
+    
+    # Split content into manageable chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    chunks = splitter.split_text(page_content)
 
-def get_most_relevant_chunks(query_embedding, chunk_embeddings, chunks, top_k=3):
+    # Compute embeddings and cache them
+    embedding_model = OpenAIEmbeddings(openai_api_key=openai_api_key)
+    chunk_embeddings = embedding_model.embed_documents(chunks)
+    
+    # Store in cache
+    embedding_cache[url] = (chunks, chunk_embeddings)
+    
+    return chunks, chunk_embeddings
+
+def get_most_relevant_chunks(query_embedding: List[float], 
+                             chunk_embeddings: List[List[float]], 
+                             chunks: List[str], 
+                             top_k: int = 3) -> List[str]:
     """Find the top-k most relevant chunks using cosine similarity."""
+    if not chunk_embeddings or not chunks:
+        return []
+        
     similarities = [1 - cosine(query_embedding, emb) for emb in chunk_embeddings]
     top_indices = np.argsort(similarities)[-top_k:][::-1]
+    
     return [chunks[i] for i in top_indices]
 
-@app.post("/process_page/")
-async def process_page(request: QueryRequest, authorization: str = Header(None)):
-    # Extract API key from Authorization header
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=400, detail="Missing or invalid API key")
+# ==========================================================
+# API Endpoints
+# ==========================================================
 
-    openai_api_key = authorization.split("Bearer ")[1].strip()
-
+@app.post("/process_page/", response_model=AnswerResponse)
+async def process_page(request: QueryRequest, api_key: str = Depends(extract_api_key)):
     try:
+        # Get or create embeddings for the URL
+        chunks, chunk_embeddings = get_or_create_embeddings(request.url, api_key)
         
-        # Check if the URL is already embedded in cache
-        if request.url in embedding_cache:
-            chunks, chunk_embeddings = embedding_cache[request.url]
-        else:
-            # Fetch and split webpage content
-            page_content = fetch_page_content(request.url)
-            
-            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-            chunks = splitter.split_text(page_content)
-
-            # Initialize OpenAI components dynamically with API key
-            embedding_model = OpenAIEmbeddings(openai_api_key=openai_api_key)
-
-            # Compute embeddings once and cache
-            chunk_embeddings = embedding_model.embed_documents(chunks)
-            embedding_cache[request.url] = (chunks, chunk_embeddings)
-
-        # Compute query embedding
-        embedding_model = OpenAIEmbeddings(openai_api_key=openai_api_key)  # Reinitialize for consistency
+        # Create embedding model for the query
+        embedding_model = OpenAIEmbeddings(openai_api_key=api_key)
         query_embedding = embedding_model.embed_query(request.question)
-
-        # Retrieve relevant chunks
+        
+        # Get the most relevant chunks
         relevant_chunks = get_most_relevant_chunks(query_embedding, chunk_embeddings, chunks)
-
-        # Generate response
+        
+        # If no relevant chunks found, inform the user
+        if not relevant_chunks:
+            return {"answer": "I couldn't find relevant information to answer your question on this page."}
+        
+        # Generate response using LLM
         context = "\n".join(relevant_chunks)
-        llm = ChatOpenAI(openai_api_key=openai_api_key)
-        response = llm.invoke(f"Answer the question based on this context:\n\n{context}\n\nQuestion: {request.question}")
-
-        # Extract answer
-        response_text = response.content if hasattr(response, "content") else str(response)
-
-        return {"answer": response_text}
+        llm = ChatOpenAI(openai_api_key=api_key)
+        response = llm.invoke(
+            f"Answer the question based on this context:\n\n{context}\n\nQuestion: {request.question}"
+        )
+        
+        # Extract answer text
+        answer = response.content if hasattr(response, "content") else str(response)
+        
+        return {"answer": answer}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
-
-@app.post("/summarize_page/")
-async def summarize_page(request: SummarizationRequest, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=400, detail="Missing or invalid API key")
-
-    openai_api_key = authorization.split("Bearer ")[1].strip()
-
-    style_prompts = {
-        "Concise": "Summarize the following text in a short and precise way.",
-        "Bullet Points": "Summarize the following text using bullet points.",
-        "Casual": "Summarize the following text in a friendly and conversational way.",
-        "Professional": "Summarize the following text in a formal and professional manner."
-    }
-
-    if request.style not in style_prompts:
-        raise HTTPException(status_code=400, detail="Invalid summarization style")
+@app.post("/summarize_page/", response_model=SummaryResponse)
+async def summarize_page(request: SummarizationRequest, api_key: str = Depends(extract_api_key)):
+    # Validate summarization style
+    if request.style not in SUMMARIZATION_STYLES:
+        valid_styles = ", ".join(SUMMARIZATION_STYLES.keys())
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid summarization style. Valid options are: {valid_styles}"
+        )
 
     try:
+        # Fetch page content
         page_content = fetch_page_content(request.url)
-        if not page_content:
-            raise HTTPException(status_code=400, detail="Failed to extract webpage content")
-
-        # **Step 1: Split text into smaller chunks**
+        
+        # Split text into manageable chunks
         splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=100)
         chunks = splitter.split_text(page_content)
-
-        # **Step 2: Initialize OpenAI Chat Model**
-        llm = ChatOpenAI(openai_api_key=openai_api_key)
-
-        # **Step 3: Summarize each chunk separately**
+        
+        # Limit to 5 chunks to prevent token overload
+        chunks = chunks[:5]
+        
+        # Initialize LLM
+        llm = ChatOpenAI(openai_api_key=api_key)
+        
+        # Process each chunk separately
         summaries = []
-        for chunk in chunks[:5]:  # Process up to 5 chunks to avoid token overload
-            prompt = f"{style_prompts[request.style]}\n\nText:\n{chunk}"
+        for chunk in chunks:
+            prompt = f"{SUMMARIZATION_STYLES[request.style]}\n\nText:\n{chunk}"
             response = llm.invoke(prompt)
-            response_text = response.content if hasattr(response, "content") else str(response)
-            summaries.append(response_text)
-
-        # **Step 4: Combine summaries into a final response**
+            chunk_summary = response.content if hasattr(response, "content") else str(response)
+            summaries.append(chunk_summary)
+        
+        # Combine summaries
         final_summary = "\n".join(summaries)
-
+        
         return {"summary": final_summary}
 
     except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        raise HTTPException(status_code=500, detail=f"Error summarizing page: {str(e)}")
 
-@app.post("/get_suggestions/")
-async def get_suggestions(request: AnalyzeRequest, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=400, detail="Missing or invalid API key")
-
-    openai_api_key = authorization.split("Bearer ")[1].strip()
-
+@app.post("/get_suggestions/", response_model=SuggestionResponse)
+async def get_suggestions(request: AnalyzeRequest, api_key: str = Depends(extract_api_key)):
     try:
-        llm = ChatOpenAI(openai_api_key=openai_api_key)
+        # Initialize LLM
+        llm = ChatOpenAI(openai_api_key=api_key)
+        
+        # Fetch page content
         page_content = fetch_page_content(request.url)
         
-        if not page_content:
-            raise HTTPException(status_code=400, detail="Failed to extract webpage content")
-
-        prompt = f"""
+        # Define prompt for entity extraction
+        prompt = """
         Task: Extract the four most important entities from the following text:
-        "{page_content}"
+        "{text}"
 
         Instructions:
         1. Identify the four key entities (people, organizations, locations, dates, concepts, or other critical elements) that best represent the core meaning of the text.
         2. Ensure that the selected entities capture the essence of the content.
         3. Construct a **concise and meaningful phrase** (4 to 6 words) using these four entities.
-        4. Make sure all the phrase should have menaing also avoid any special characters like "@,#,$,% etc"
-        4. **Return the result in a structured JSON format.**
+        4. Make sure all the phrases should have meaning also avoid any special characters like "@,#,$,% etc"
+        5. **Return the result in a structured JSON format.**
 
         ### **Example Output:**
         {{
@@ -212,42 +257,72 @@ async def get_suggestions(request: AnalyzeRequest, authorization: str = Header(N
                 "LangGraph OSS LLM compatibility"
             ]
         }}
-        """
-
+        """.format(text=page_content)
+        
+        # Get response from LLM
         response = llm.invoke([HumanMessage(content=prompt)])
-
-        # Ensure the response is valid JSON
+        
+        # Parse JSON response
         try:
             suggestions = json.loads(response.content)
+            return {"suggestions": suggestions}
         except json.JSONDecodeError:
-            raise HTTPException(status_code=500, detail="Failed to parse response from OpenAI.")
-
-        #print(suggestions)
-        return {"suggestions": suggestions}
+            raise HTTPException(status_code=500, detail="Failed to parse suggestions from LLM")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        raise HTTPException(status_code=500, detail=f"Error getting suggestions: {str(e)}")
 
-GOOGLE_SEARCH_API = "https://www.googleapis.com/customsearch/v1"
-GOOGLE_API_KEY = "AIzaSyD76l49ZmMXIg0COfBaK6oSIl8SJpqoSyo"
-SEARCH_ENGINE_ID = "3319737b3cde242e5"  # From Google Programmable Search
-
-@app.get("/fetch_related_links")
+@app.get("/fetch_related_links", response_model=RelatedLinksResponse)
 async def fetch_related_links(query: str):
+    # Get environment variables
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    search_engine_id = os.getenv("SEARCH_ENGINE_ID")
+    google_search_api = os.getenv("GOOGLE_SEARCH_API")
+    
+    # Validate necessary environment variables
+    if not all([google_api_key, search_engine_id, google_search_api]):
+        raise HTTPException(
+            status_code=500, 
+            detail="Missing required environment variables for Google search"
+        )
+    
+    # Set up search parameters
     params = {
-        "key": GOOGLE_API_KEY,
-        "cx": SEARCH_ENGINE_ID,
-        "q": query
+        "key": google_api_key,
+        "cx": search_engine_id,
+        "q": query,
+        "num": 5  # Fetch top 5 results
     }
 
     try:
-        response = requests.get(GOOGLE_SEARCH_API, params=params)
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Failed to fetch URLs")
+        # Send request to Google Custom Search API
+        response = requests.get(google_search_api, params=params)
+        response.raise_for_status()
         
-        data = response.json()
-        urls = [item["link"] for item in data.get("items", [])]
-        return {"urls": urls}
+        # Parse results
+        search_results = response.json().get("items", [])
+        
+        # Format results
+        related_links = []
+        for item in search_results:
+            link = item.get("link")
+            title = item.get("title")
+            hostname = requests.utils.urlparse(link).netloc
+            
+            related_links.append({
+                "title": title,
+                "url": link,
+                "hostname": hostname
+            })
+        
+        return {"related_links": related_links}
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching related links: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+# For direct execution
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
