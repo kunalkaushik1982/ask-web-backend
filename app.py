@@ -176,56 +176,6 @@ async def summarize_page(request: SummarizationRequest, authorization: str = Hea
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     
-# @app.post("/get_suggestions/")
-# async def get_suggestions(request: AnalyzeRequest, authorization: str = Header(None)):
-#     print("1")
-#     if not authorization or not authorization.startswith("Bearer "):
-#         raise HTTPException(status_code=400, detail="Missing or invalid API key")
-
-#     openai_api_key = authorization.split("Bearer ")[1].strip()
-
-#     try:
-#         llm = ChatOpenAI(openai_api_key=openai_api_key)
-#         page_content = fetch_page_content(request.url)
-#         if not page_content:
-#             raise HTTPException(status_code=400, detail="Failed to extract webpage content")
-#         # prompt = f"""
-#         # Extract key entities from the following text:        
-#         # "{page_content}"        
-#         # Provide a JSON response with categories like "people", "organizations", "locations", "events", and "concepts".
-#         # Please make sure the entities are most important topic as per the documents and maximum entries of every entities should be less than 5.
-#         # """
-
-#         prompt = f"""
-#         Task: Extract the four most important entities from the following text:
-#         "{page_content}"
-#         Instructions:
-#         Identify the four key entities (people, organizations, locations, dates, concepts, or other critical elements) that best represent the core meaning of the text.
-#         Ensure that the selected entities capture the essence of the content.
-#         Construct a coherent and concise phrase (4 to 6 words) incorporating these four entities in a meaningful way.
-#         Make sure to Provide a JSON response of phrase
-#         Example Input:
-#         "Hey there! If you're looking to get started with LangGraph, we've got all the resources you need right here. From basic tutorials to deployment guides and FAQs, we've got you covered. Wondering if LangGraph is open source or if it impacts your app's performance? We've got answers to those questions too. And if you're curious about the differences between LangGraph and other frameworks, we can help with that too. So go ahead, dive in and start exploring all that LangGraph has to offer!
-#         Hey there! If you're wondering about using LangGraph, here are some common questions and answers to help you out. LangChain isn't necessary to use LangGraph - they're separate tools. LangGraph stands out from other agent frameworks, and it shouldn't slow down your app's performance. LangGraph is open source and free to use, and there's also a LangGraph Platform available. You have deployment options for the platform, and there's an API reference and troubleshooting section to help you out. Hope this info helps!
-#         LangGraph is an open-source orchestration framework that is more low-level and controllable than LangChain. It won't slow down your app and is great for complex tasks tailored to your company's needs. LangGraph Platform is a service for deploying and scaling LangGraph applications, with different deployment options including self-hosted, cloud, and bring your own cloud. Plus, it's all free to use!
-#         Hey there! The LangGraph Platform is a cool tool that you can deploy on your own infrastructure. While it's not open source, there is a free self-hosted version available with basic features. The Cloud SaaS deployment option is free during beta, but will eventually become a paid service. Don't worry, they'll give plenty of notice before charging. You can also opt for the Bring Your Own Cloud or Self-Hosted Enterprise options, but those are paid services. If you want more info, reach out to their sales team. And good news - LangGraph works with any LLMs, even if they don't support tool calling. So go ahead and have fun using it with OSS LLMs too! Plus, you can use LangGraph Studio without logging into LangSmith if you want. Happy exploring!
-#         Hey there! Just a heads up, we use cookies to make your experience on our site better. By accepting them, you help us improve our documentation. Thanks a bunch! Also, we use Google Analytics and GitHub to keep track of things and make sure everything is running smoothly. Thanks for your understanding! ❤️"
-
-#         Expected Output:
-#         Extracted Entities: LangGraph, LangChain, LLM, AI capabilities
-#         Framed Phrase: "
-#         LangGraph vs LangChain differences
-#         LangGraph Platform deployment options
-#         LangGraph open source license
-#         LangGraph OSS LLM compatibility
-#         LangGraph Studio local setup"
-#         """
-#         response = llm.invoke([HumanMessage(content=prompt)])   
-#         print (response)     
-#         return {"suggestions": response.content}
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/get_suggestions/")
 async def get_suggestions(request: AnalyzeRequest, authorization: str = Header(None)):
@@ -247,8 +197,9 @@ async def get_suggestions(request: AnalyzeRequest, authorization: str = Header(N
 
         Instructions:
         1. Identify the four key entities (people, organizations, locations, dates, concepts, or other critical elements) that best represent the core meaning of the text.
-        2. Ensure that the selected entities capture the essence of the content and should have menaing also avoid any special characters.
+        2. Ensure that the selected entities capture the essence of the content.
         3. Construct a **concise and meaningful phrase** (4 to 6 words) using these four entities.
+        4. Make sure all the phrase should have menaing also avoid any special characters like "@,#,$,% etc"
         4. **Return the result in a structured JSON format.**
 
         ### **Example Output:**
@@ -274,5 +225,29 @@ async def get_suggestions(request: AnalyzeRequest, authorization: str = Header(N
         #print(suggestions)
         return {"suggestions": suggestions}
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+GOOGLE_SEARCH_API = "https://www.googleapis.com/customsearch/v1"
+GOOGLE_API_KEY = "AIzaSyD76l49ZmMXIg0COfBaK6oSIl8SJpqoSyo"
+SEARCH_ENGINE_ID = "3319737b3cde242e5"  # From Google Programmable Search
+
+@app.get("/fetch_related_links")
+async def fetch_related_links(query: str):
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": SEARCH_ENGINE_ID,
+        "q": query
+    }
+
+    try:
+        response = requests.get(GOOGLE_SEARCH_API, params=params)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to fetch URLs")
+        
+        data = response.json()
+        urls = [item["link"] for item in data.get("items", [])]
+        return {"urls": urls}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
