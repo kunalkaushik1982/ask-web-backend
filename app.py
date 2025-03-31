@@ -229,10 +229,6 @@ async def get_suggestions(request: AnalyzeRequest, authorization: str = Header(N
         raise HTTPException(status_code=500, detail=str(e))
     
 
-GOOGLE_SEARCH_API = "https://www.googleapis.com/customsearch/v1"
-GOOGLE_API_KEY = "AIzaSyD76l49ZmMXIg0COfBaK6oSIl8SJpqoSyo"
-SEARCH_ENGINE_ID = "3319737b3cde242e5"  # From Google Programmable Search
-
 @app.get("/fetch_related_links")
 async def fetch_related_links(query: str):
     params = {
