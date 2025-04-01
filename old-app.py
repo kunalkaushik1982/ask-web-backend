@@ -247,7 +247,7 @@ async def fetch_related_links(query: str):
         data = response.json()
         urls = [item["link"] for item in data.get("items", [])]
         # return {"urls": urls}
-        #print(urls)
+        print(urls)
 
         search_results = response.json().get("items", [])
         related_links = []
@@ -261,7 +261,7 @@ async def fetch_related_links(query: str):
                 "url": link,
                 "hostname": hostname
             })
-        #print(related_links)
+        print(related_links)
         return {"related_links": related_links}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

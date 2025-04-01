@@ -278,7 +278,7 @@ async def fetch_related_links(query: str):
     google_api_key = os.getenv("GOOGLE_API_KEY")
     search_engine_id = os.getenv("SEARCH_ENGINE_ID")
     google_search_api = os.getenv("GOOGLE_SEARCH_API")
-    
+    #print(query)
     # Validate necessary environment variables
     if not all([google_api_key, search_engine_id, google_search_api]):
         raise HTTPException(
@@ -293,14 +293,16 @@ async def fetch_related_links(query: str):
         "q": query,
         "num": 5  # Fetch top 5 results
     }
-
+    #print(params)
     try:
         # Send request to Google Custom Search API
         response = requests.get(google_search_api, params=params)
         response.raise_for_status()
+        #print(response)
         
         # Parse results
         search_results = response.json().get("items", [])
+        #print(search_results)
         
         # Format results
         related_links = []
@@ -318,6 +320,7 @@ async def fetch_related_links(query: str):
         return {"related_links": related_links}
         
     except requests.exceptions.RequestException as e:
+        #print(str(e))
         raise HTTPException(status_code=500, detail=f"Error fetching related links: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
