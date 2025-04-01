@@ -270,9 +270,9 @@ async def get_suggestions(request: AnalyzeRequest, api_key: str = Depends(extrac
             raise HTTPException(status_code=500, detail="Failed to parse suggestions from LLM")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/fetch_related_links")
+        raise HTTPException(status_code=500, detail=f"Error getting suggestions: {str(e)}")
+
+@app.get("/fetch_related_links", response_model=RelatedLinksResponse)
 async def fetch_related_links(query: str):
     # Get environment variables
     google_api_key = os.getenv("GOOGLE_API_KEY")
